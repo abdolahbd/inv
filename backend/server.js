@@ -170,12 +170,24 @@ async function initDB() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS files (
       id VARCHAR(64) PRIMARY KEY,
+      workspace_id VARCHAR(64),
+      job_id VARCHAR(64),
       user_email VARCHAR(255),
       original_name TEXT,
       stored_path TEXT,
       mime_type VARCHAR(255),
       size_bytes BIGINT DEFAULT 0,
+      page_number INT DEFAULT NULL,
       pages INT DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS workspaces (
+      id VARCHAR(64) PRIMARY KEY,
+      user_email VARCHAR(255) NOT NULL,
+      name VARCHAR(255) NOT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
@@ -183,16 +195,37 @@ async function initDB() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS jobs (
       id VARCHAR(64) PRIMARY KEY,
+      workspace_id VARCHAR(64),
       user_email VARCHAR(255),
       status VARCHAR(50) DEFAULT 'pending',
       organization VARCHAR(50),
+      columns_mode VARCHAR(20) DEFAULT 'auto',
+      inferred_fields_json JSON,
       fields_json JSON,
       result_json JSON,
+      total_units INT DEFAULT 0,
+      processed_units INT DEFAULT 0,
+      total_pages INT DEFAULT 0,
+      processed_pages INT DEFAULT 0,
+      current_item_label VARCHAR(255),
       error_text TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )
   `);
+
+  await db.query(`ALTER TABLE files ADD COLUMN workspace_id VARCHAR(64)`).catch(() => {});
+  await db.query(`ALTER TABLE files ADD COLUMN job_id VARCHAR(64)`).catch(() => {});
+  await db.query(`ALTER TABLE files ADD COLUMN page_number INT DEFAULT NULL`).catch(() => {});
+
+  await db.query(`ALTER TABLE jobs ADD COLUMN workspace_id VARCHAR(64)`).catch(() => {});
+  await db.query(`ALTER TABLE jobs ADD COLUMN columns_mode VARCHAR(20) DEFAULT 'auto'`).catch(() => {});
+  await db.query(`ALTER TABLE jobs ADD COLUMN inferred_fields_json JSON`).catch(() => {});
+  await db.query(`ALTER TABLE jobs ADD COLUMN total_units INT DEFAULT 0`).catch(() => {});
+  await db.query(`ALTER TABLE jobs ADD COLUMN processed_units INT DEFAULT 0`).catch(() => {});
+  await db.query(`ALTER TABLE jobs ADD COLUMN total_pages INT DEFAULT 0`).catch(() => {});
+  await db.query(`ALTER TABLE jobs ADD COLUMN processed_pages INT DEFAULT 0`).catch(() => {});
+  await db.query(`ALTER TABLE jobs ADD COLUMN current_item_label VARCHAR(255)`).catch(() => {});
 
   await db.query(
     `
@@ -398,6 +431,21 @@ async function checkLimits(email, newPages, newBytes) {
   return { user, plan };
 }
 
+async function ensureDefaultWorkspace(email) {
+  const [rows] = await db.query(
+    `SELECT id, name, created_at FROM workspaces WHERE user_email = ? ORDER BY created_at ASC`,
+    [email]
+  );
+  if (rows.length) return rows[0];
+
+  const workspaceId = newId();
+  await db.query(
+    `INSERT INTO workspaces (id, user_email, name) VALUES (?, ?, ?)`,
+    [workspaceId, email, "my first workspace"]
+  );
+  return { id: workspaceId, name: "my first workspace" };
+}
+
 function cleanJsonText(text) {
   return text.replace(/```json/gi, "").replace(/```/g, "").trim();
 }
@@ -418,6 +466,17 @@ async function extractTextFromFile(filePath, mimeType) {
   return { text, pages: 1 };
 }
 
+async function getPdfPageText(filePath, pageNumber) {
+  const buffer = fs.readFileSync(filePath);
+  const parser = new PDFParse({ data: buffer });
+  try {
+    const result = await parser.getText({ partial: [pageNumber] });
+    return (result?.text || "").trim();
+  } finally {
+    await parser.destroy().catch(() => {});
+  }
+}
+
 function normalizeRows(data) {
   if (!data) return [];
   if (Array.isArray(data)) return data;
@@ -433,16 +492,17 @@ function normalizeRows(data) {
 async function askGemini({ filePath, mimeType, text, fields, organization }) {
   if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY in .env");
 
+  const wantsAutoColumns = fields.includes("auto_detect_columns");
   const prompt = `You are a document table extraction engine.
 Return ONLY valid JSON.
 Organization mode: ${organization}
-Fields to extract: ${fields.join(", ")}
-Rules: Extract tables, preserve columns, use null, valid JSON.`;
+Fields to extract: ${wantsAutoColumns ? "AUTO_DETECT from content of this page/image only" : fields.join(", ")}
+Rules: Extract tables, preserve columns, use null, valid JSON.${wantsAutoColumns ? " Infer best column names from first page content." : ""}`;
 
   const parts = [{ text: prompt }];
 
-  if (filePath && mimeType === "application/pdf") parts.push(fileToGeminiPart(filePath, mimeType));
-  else if (text) parts.push({ text });
+  if (filePath) parts.push(fileToGeminiPart(filePath, mimeType));
+  if (text) parts.push({ text });
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
   const response = await axios.post(url, {
@@ -470,6 +530,58 @@ app.get("/api/me", authenticateToken, async (req, res) => {
     const { password_hash, ...safeUser } = user;
     
     res.json({ success: true, user: safeUser, plan });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get("/api/workspaces", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    await ensureDefaultWorkspace(email);
+    const [rows] = await db.query(
+      `SELECT id, name, created_at FROM workspaces WHERE user_email = ? ORDER BY created_at ASC`,
+      [email]
+    );
+    res.json({ success: true, workspaces: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/api/workspaces", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const name = String(req.body.name || "").trim();
+    if (!name) return res.status(400).json({ success: false, error: "Workspace name is required" });
+
+    const workspaceId = newId();
+    await db.query(
+      `INSERT INTO workspaces (id, user_email, name) VALUES (?, ?, ?)`,
+      [workspaceId, email, name]
+    );
+    res.json({ success: true, workspace: { id: workspaceId, name } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get("/api/workspaces/:id/jobs", authenticateToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const workspaceId = req.params.id;
+    const [workspaceRows] = await db.query(
+      `SELECT id FROM workspaces WHERE id = ? AND user_email = ?`,
+      [workspaceId, email]
+    );
+    if (!workspaceRows.length) return res.status(404).json({ success: false, error: "Workspace not found" });
+
+    const [jobs] = await db.query(
+      `SELECT id, status, columns_mode, inferred_fields_json, fields_json, result_json, total_units, processed_units, total_pages, processed_pages, current_item_label, error_text, created_at, updated_at
+       FROM jobs WHERE workspace_id = ? AND user_email = ? ORDER BY created_at DESC`,
+      [workspaceId, email]
+    );
+    res.json({ success: true, jobs });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -598,10 +710,19 @@ app.post("/api/upload", authenticateToken, upload.array("files", 20), async (req
 app.post("/api/jobs", authenticateToken, upload.array("files", 20), async (req, res) => {
   try {
     const email = req.user.email;
+    const workspaceId = req.body.workspace_id;
     const organization = req.body.organization || "one_table";
-    const fields = JSON.parse(req.body.fields || "[]");
+    const columnsMode = req.body.columns_mode === "manual" ? "manual" : "auto";
+    const fields = JSON.parse(req.body.fields || "[]").map((f) => String(f || "").trim()).filter(Boolean);
 
-    if (!fields.length) return res.status(400).json({ success: false, error: "fields is required" });
+    const [workspaceRows] = await db.query(
+      `SELECT id FROM workspaces WHERE id = ? AND user_email = ?`,
+      [workspaceId, email]
+    );
+    if (!workspaceRows.length) return res.status(400).json({ success: false, error: "Invalid workspace_id" });
+    if (columnsMode === "manual" && !fields.length) {
+      return res.status(400).json({ success: false, error: "fields is required in manual mode" });
+    }
 
     const files = req.files || [];
     if (!files.length) return res.status(400).json({ success: false, error: "No files uploaded" });
@@ -609,6 +730,7 @@ app.post("/api/jobs", authenticateToken, upload.array("files", 20), async (req, 
     let totalPages = 0;
     let totalBytes = 0;
     const uploadedFiles = [];
+    let totalUnits = 0;
 
     for (const file of files) {
       const extracted = await extractTextFromFile(file.path, file.mimetype);
@@ -622,22 +744,36 @@ app.post("/api/jobs", authenticateToken, upload.array("files", 20), async (req, 
         size: file.size,
         pages: extracted.pages,
       });
+      totalUnits += extracted.pages;
     }
 
     await checkLimits(email, totalPages, totalBytes);
 
     const jobId = newId();
     for (const file of uploadedFiles) {
-      const fileId = newId();
-      await db.query(
-        `INSERT INTO files (id, user_email, original_name, stored_path, mime_type, size_bytes, pages) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [fileId, email, file.originalname, file.path, file.mimetype, file.size, file.pages]
-      );
+      if (file.mimetype === "application/pdf") {
+        for (let page = 1; page <= file.pages; page++) {
+          const fileId = newId();
+          await db.query(
+            `INSERT INTO files (id, workspace_id, job_id, user_email, original_name, stored_path, mime_type, size_bytes, page_number, pages)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+            [fileId, workspaceId, jobId, email, file.originalname, file.path, file.mimetype, file.size, page]
+          );
+        }
+      } else {
+        const fileId = newId();
+        await db.query(
+          `INSERT INTO files (id, workspace_id, job_id, user_email, original_name, stored_path, mime_type, size_bytes, page_number, pages)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1)`,
+          [fileId, workspaceId, jobId, email, file.originalname, file.path, file.mimetype, file.size]
+        );
+      }
     }
 
     await db.query(
-      `INSERT INTO jobs (id, user_email, status, organization, fields_json) VALUES (?, ?, 'pending', ?, ?)`,
-      [jobId, email, organization, JSON.stringify(fields)]
+      `INSERT INTO jobs (id, workspace_id, user_email, status, organization, columns_mode, fields_json, total_units, total_pages)
+       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+      [jobId, workspaceId, email, organization, columnsMode, JSON.stringify(fields), totalUnits, totalPages]
     );
 
     await db.query(
@@ -647,7 +783,7 @@ app.post("/api/jobs", authenticateToken, upload.array("files", 20), async (req, 
 
     processJob(jobId).catch(console.error);
 
-    res.json({ success: true, job_id: jobId, status: "pending" });
+    res.json({ success: true, job_id: jobId, status: "pending", total_units: totalUnits, total_pages: totalPages });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -675,33 +811,61 @@ async function processJob(jobId) {
 
   try {
     const [files] = await db.query(
-      `SELECT * FROM files WHERE user_email = ? ORDER BY created_at DESC LIMIT 20`,
-      [job.user_email]
+      `SELECT * FROM files WHERE job_id = ? AND user_email = ? ORDER BY created_at ASC`,
+      [jobId, job.user_email]
     );
 
-    const fields = JSON.parse(job.fields_json || "[]");
+    const manualFields = JSON.parse(job.fields_json || "[]");
+    let activeFields = Array.isArray(manualFields) ? manualFields : [];
     const organization = job.organization || "one_table";
     let finalResult = [];
+    let processedUnits = 0;
+    let processedPages = 0;
 
-    for (const file of files.reverse()) {
-      const extracted = await extractTextFromFile(file.stored_path, file.mime_type);
+    for (const file of files) {
+      const itemLabel = file.page_number
+        ? `${file.original_name} - page ${file.page_number}`
+        : file.original_name;
+      await db.query(
+        `UPDATE jobs SET current_item_label = ? WHERE id = ?`,
+        [itemLabel, jobId]
+      );
+
+      const pageText = file.mime_type === "application/pdf"
+        ? await getPdfPageText(file.stored_path, file.page_number || 1)
+        : null;
       const result = await askGemini({
-        filePath: file.stored_path,
+        filePath: file.mime_type.startsWith("image/") ? file.stored_path : null,
         mimeType: file.mime_type,
-        text: extracted.text,
-        fields,
+        text: pageText || undefined,
+        fields: activeFields.length ? activeFields : ["auto_detect_columns"],
         organization,
       });
 
+      if ((job.columns_mode || "auto") === "auto" && !activeFields.length) {
+        const firstRow = normalizeRows(result)[0] || {};
+        activeFields = Object.keys(firstRow);
+        await db.query(`UPDATE jobs SET inferred_fields_json = ? WHERE id = ?`, [
+          JSON.stringify(activeFields), jobId
+        ]);
+      }
+
       if (organization === "one_table") finalResult.push(...normalizeRows(result));
       else finalResult.push({ file: file.original_name, result });
+
+      processedUnits += 1;
+      processedPages += Number(file.pages || 1);
+      await db.query(
+        `UPDATE jobs SET processed_units = ?, processed_pages = ? WHERE id = ?`,
+        [processedUnits, processedPages, jobId]
+      );
     }
 
-    await db.query(`UPDATE jobs SET status = 'done', result_json = ? WHERE id = ?`, [
+    await db.query(`UPDATE jobs SET status = 'done', result_json = ?, current_item_label = NULL WHERE id = ?`, [
       JSON.stringify(finalResult), jobId
     ]);
   } catch (err) {
-    await db.query(`UPDATE jobs SET status = 'failed', error_text = ? WHERE id = ?`, [err.message, jobId]);
+    await db.query(`UPDATE jobs SET status = 'failed', error_text = ?, current_item_label = NULL WHERE id = ?`, [err.message, jobId]);
   }
 }
 
